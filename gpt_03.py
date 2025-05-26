@@ -1,657 +1,615 @@
 #!/usr/bin/env python
+# -*- coding: utf-8 -*-
 """
-Spec Sync – autonomous tool for ordering aircraft specification files
-and drawings on Windows file servers.
+Spec Sync v1.2 – advanced sorter for aircraft specifications
+(см. CHANGELOG ниже)
 
-This is v1.1
-    • Robust abbreviation search (underscores, dots, spaces, hyphens).
-    • Empty INDEX.xlsx bug fixed.
-    • Journal‑file cross‑check (existing INDEX / registry).
-    • Skip copy if file already present in target.
-    • GUI polish + Journal picker + extension filter field.
+Author : ChatGPT o3 for Владимир, 2025-05-26
+License: MIT
 """
 
 from __future__ import annotations
 
 import argparse
-import concurrent.futures
-import contextlib
+import csv
 import hashlib
 import json
 import logging
 import os
 import re
 import shutil
-import sqlite3
 import sys
 import threading
-import warnings
-from dataclasses import dataclass, field
-from datetime import datetime as dt
+import time
+import zipfile
+from datetime import datetime
 from pathlib import Path
-from typing import Iterable, Optional, Set
+from typing import Callable, Optional
 
-# ───────────── third‑party ───────────────────────────────────────────
+# ────────────────────────── 3-rd-party ───────────────────────────
 import openpyxl
-import pytesseract
 import yaml
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.filters import AutoFilter
-from pdfminer.high_level import extract_text
-from PIL import Image
-from PySide6.QtCore import Qt, QThread, Signal, QObject
-from PySide6.QtGui import QAction
+from PySide6.QtCore import Qt, QThread, Signal, Slot
+from PySide6.QtGui import QAction, QCloseEvent, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
-    QGridLayout,
-    QGroupBox,
-    QHBoxLayout,
     QLabel,
-    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
-    QPushButton,
     QProgressBar,
-    QRadioButton,
+    QStatusBar,
+    QTabWidget,
     QTextEdit,
-    QVBoxLayout,
+    QTreeWidget,
+    QTreeWidgetItem,
     QWidget,
+    QPushButton,
+    QLineEdit,
+    QVBoxLayout,
+    QHBoxLayout,
+    QRadioButton,
+    QCheckBox,
 )
 
+try:                       # optional deps
+    import pytesseract
+    from PIL import Image
+except ModuleNotFoundError:
+    pytesseract = None     # type: ignore
+
 try:
-    import pythoncom
-    from win32com.client import Dispatch
-except ImportError:  # pragma: no cover
-    pythoncom = None
+    from pdfminer.high_level import extract_text as pdf_text
+except ModuleNotFoundError:
+    pdf_text = None        # type: ignore
 
-APP_NAME = "Spec Sync"
-DB_NAME = "inventory.db"
-LOG_FILE = "sync.log"
-EXCEL_NAME = "INDEX.xlsx"
-DUMP_DIR = "dumps"
-DEFAULT_RULES = "rules.yaml"
-DEFAULT_EXTS = {
-    ".pdf",
-    ".tif",
-    ".tiff",
-    ".jpg",
-    ".jpeg",
-    ".png",
-    ".bmp",
-    ".gif",
-}
-REV_PAT = re.compile(r"(?:[_\-\s]REV[_\-\s]?|[_\-\s]ISSUE[_\-\s]?)([A-Z0-9]+)", re.I)
+try:                       # .lnk creation
+    import win32com.client
+except ModuleNotFoundError:
+    win32com = None        # type: ignore
 
-# ────────────────────────────── logging ──────────────────────────────
-log = logging.getLogger(APP_NAME)
-log.setLevel(logging.DEBUG)
-_fh = logging.FileHandler(LOG_FILE, "a", "utf-8")
-_fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-log.addHandler(_fh)
-
-warnings.filterwarnings("ignore", category=UserWarning, module="pdfminer")
+# ───────────────────────── Config ────────────────────────────────
+ALLOWED_EXTS = {".pdf", ".tif", ".tiff", ".jpg", ".jpeg", ".png", ".bmp", ".gif"}
+INDEX_HEADERS = (
+    "Abbrev", "File_Name", "Format", "Revision", "Category", "Tags",
+    "Size_MB", "Modified", "SHA256", "Link",
+)
+REV_PAT = re.compile(
+    r"(?:\b|_|\-|\()(?:(?:REV(?:ISION)?|ISSUE)[ _\-]*)"
+    r"(?P<rev>[A-Z0-9]{1,3})", re.I
+)
+CHUNK = 1 << 20  # 1 MiB
+LOG = logging.getLogger("specsync")
+LOG.setLevel(logging.DEBUG)
+handler = logging.StreamHandler(sys.stdout)
+handler.setFormatter(logging.Formatter(
+    "%(asctime)s  %(levelname)-8s  %(message)s", "%H:%M:%S"
+))
+LOG.addHandler(handler)
 
 
-@dataclass(slots=True)
-class FileRecord:
-    abbrev: str
-    src_path: Path
-    dest_path: Path
-    fmt: str
-    size_mb: float
-    mtime: str
-    sha256: str
-    revision: str = ""
-    category: str = ""
-    tags: list[str] = field(default_factory=list)
+# ═════════════════════════ Engine ════════════════════════════════
+class AbbrevMatcher:
+    """Гибкая проверка имени файла на наличие аббревиатур."""
+
+    def __init__(self, abbrevs: set[str], *, case_sensitive: bool):
+        flags = 0 if case_sensitive else re.I
+        # сортируем от длинных к коротким → минимизируем ложные срабатывания
+        self.abbrev_order = sorted(abbrevs, key=len, reverse=True)
+        # составляем один big-regex:  (?P<A>AMS)|(?P<B>BAC)|…
+        parts = []
+        self.group2abbr: dict[str, str] = {}
+        for idx, abbr in enumerate(self.abbrev_order):
+            safe = re.escape(abbr)
+            # допускаем, что следом может идти тире/подчёркивание/цифры/скобка
+            pat = rf"(?P<G{idx}>{safe})(?=[\W_0-9]|$)"
+            parts.append(pat)
+            self.group2abbr[f"G{idx}"] = abbr
+        self.regex = re.compile("|".join(parts), flags)
+
+    def find(self, fname: str) -> Optional[str]:
+        m = self.regex.search(fname)
+        if not m:
+            return None
+        # выясняем, какая именно группа сработала
+        for g, abbr in self.group2abbr.items():
+            if m.group(g):
+                return abbr
+        return None  # pragma: no cover
 
 
-# ────────────────────── utilities ────────────────────────────────────
+class SpecSync:
+    """Главный рабочий класс – выполняется в фоновом потоке."""
 
-def sha256_file(path: Path, chunk: int = 1 << 16) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        while buf := f.read(chunk):
-            h.update(buf)
-    return h.hexdigest()
-
-
-def create_shortcut(link_path: Path, target: Path) -> None:
-    if pythoncom is None:
-        return
-    try:
-        pythoncom.CoInitialize()
-        shell = Dispatch("WScript.Shell")
-        shortcut = shell.CreateShortCut(str(link_path))
-        shortcut.Targetpath = str(target)
-        shortcut.WorkingDirectory = str(target.parent)
-        shortcut.IconLocation = str(target)
-        shortcut.save()
-    except Exception as exc:  # pragma: no cover
-        log.debug("Shortcut failure: %s", exc)
-
-
-def guess_revision(fname: str) -> str:
-    m = REV_PAT.search(fname)
-    return m.group(1).upper() if m else ""
-
-
-def safe_extract_pdf(path: Path) -> str:
-    """Return first‑page text or empty string on any failure."""
-    try:
-        return extract_text(str(path), maxpages=1, caching=True)
-    except (PDFSyntaxError, ValueError, RuntimeError) as exc:
-        log.debug("PDF extract failed %s: %s", path.name, exc)
-        return ""
-
-
-def safe_ocr_image(path: Path) -> str:
-    try:
-        with Image.open(path) as img:
-            return pytesseract.image_to_string(img)
-    except (UnidentifiedImageError, OSError) as exc:
-        log.debug("OCR failed %s: %s", path.name, exc)
-        return ""
-
-
-def ocr_or_pdf_text(path: Path) -> str:
-    if path.suffix.lower() == ".pdf":
-        return safe_extract_pdf(path)
-    return safe_ocr_image(path)
-
-
-
-# ────────────────────── DB layer ─────────────────────────────────────
-
-class InventoryDB:
-    def __init__(self, db_file: Path):
-        self.db = db_file
-        self._init()
-
-    def _init(self) -> None:
-        with sqlite3.connect(self.db) as con:
-            con.execute(
-                """CREATE TABLE IF NOT EXISTS files(
-                       sha256 TEXT PRIMARY KEY,
-                       dest_path TEXT,
-                       size REAL,
-                       mtime TEXT)"""
-            )
-            con.commit()
-
-    def has(self, sha: str) -> bool:
-        with sqlite3.connect(self.db) as con:
-            cur = con.cursor()
-            cur.execute("SELECT 1 FROM files WHERE sha256=?", (sha,))
-            return cur.fetchone() is not None
-
-    def add(self, rec: FileRecord) -> None:
-        with sqlite3.connect(self.db) as con:
-            con.execute(
-                "INSERT OR IGNORE INTO files VALUES (?,?,?,?)",
-                (rec.sha256, str(rec.dest_path), rec.size_mb, rec.mtime),
-            )
-            con.commit()
-
-
-# ─────────────────── categoriser ─────────────────────────────────────
-
-class Categoriser:
-    def __init__(self, yaml_file: Path):
-        try:
-            self.rules = yaml.safe_load(yaml_file.read_text("utf-8")) or {}
-        except FileNotFoundError:
-            self.rules = {}
-        self.comp = {k: re.compile("|".join(v), re.I) for k, v in self.rules.items()}
-
-    def classify(self, rec: FileRecord, text: str) -> str:
-        for cat, pat in self.comp.items():
-            if pat.search(rec.src_path.name) or pat.search(text):
-                return cat
-        return "UNCLASSIFIED"
-
-
-# ─────────────────── SpecSync core ───────────────────────────────────
-
-class SpecSync(QObject):
-    progress = Signal(int, int, int)  # scanned, uniq, dup
-    message = Signal(str, str)       # level, text
-    finished = Signal()
-
+    # ──────────────── init & helpers ───────────────────────────
     def __init__(
         self,
-        src_roots: list[Path],
+        source_roots: list[Path],
         target_root: Path,
-        abbr_file: Path,
-        case_sensitive: bool,
-        mode_move: bool,
-        rules_file: Path,
+        abbreviations_file: Path,
+        rules_file: Optional[Path] = None,
         journal_file: Optional[Path] = None,
-        extensions: Optional[Set[str]] = None,
+        *,
+        mode: str = "copy",
+        case_sensitive: bool = True,
+        use_llm: bool = False,
         dry_run: bool = False,
+        progress_cb: Callable[[dict], None] | None = None,
+        cancel_event: threading.Event | None = None,
     ):
-        super().__init__()
-        self.src_roots = src_roots
-        self.target_root = target_root
-        self.case_sensitive = case_sensitive
-        self.mode_move = mode_move
+        self.src_roots = source_roots
+        self.tgt_root = target_root
+        self.mode = mode
         self.dry = dry_run
-        self.extensions = {e.lower().strip() if e.startswith(".") else f".{e.lower().strip()}" for e in (extensions or DEFAULT_EXTS)}
+        self.use_llm = use_llm
+        self.progress_cb = progress_cb or (lambda *_: None)
+        self.cancel = cancel_event or threading.Event()
 
-        self.abbrevs = self._load_abbrevs(abbr_file)
-        self.db = InventoryDB(target_root / DB_NAME)
-        self.cat = Categoriser(rules_file)
-        self.journal_names = self._load_journal(journal_file) if journal_file else set()
+        self.abbrevs = self._load_abbrevs(abbreviations_file)
+        self.matcher = AbbrevMatcher(self.abbrevs, case_sensitive=case_sensitive)
+        self.rules = self._load_rules(rules_file)
+        self.journal_sha, self.journal_names = (
+            self._load_journal(journal_file) if journal_file else (set(), set())
+        )
 
-        self.stop_event = threading.Event()
-        self.records: list[FileRecord] = []
-        self.scanned = self.uniq = self.dup = 0
+        self.rows: list[list] = []
+        self.stats = dict(scanned=0, unique=0, dup=0, skipped=0, errors=0)
 
-    # ───────── helpers ──────────────────────────────────────────────
-    def _load_abbrevs(self, file: Path) -> Set[str]:
-        with file.open("r", encoding="utf-8") as f:
-            raw = {ln.strip() for ln in f if ln.strip()}
-        if self.case_sensitive:
-            return raw
-        return {s.upper() for s in raw}
-
-    def _load_journal(self, path: Path) -> Set[str]:
-        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
-        ws = wb.active
-        names = {row[1].value for row in ws.iter_rows(min_row=2, values_only=True) if row[1].value}
-        wb.close()
-        return names
+        self.hash_seen: dict[str, Path] = {}  # SHA-256 ⇒ first-path
 
     @staticmethod
-    def _tokenise(name: str) -> list[str]:
-        # split on delimiters and remove empties
-        return [tok for tok in re.split(r"[\s_\-.]+", name) if tok]
+    def _load_abbrevs(p: Path) -> set[str]:
+        return {ln.strip() for ln in p.read_text("utf-8").splitlines() if ln.strip()}
 
-    def _match_abbrev(self, name: str) -> Optional[str]:
-        for tok in self._tokenise(name):
-            key = tok if self.case_sensitive else tok.upper()
-            if key in self.abbrevs:
-                return tok
-        return None
+    @staticmethod
+    def _load_rules(pth: Optional[Path]) -> dict:
+        if pth and pth.exists():
+            return yaml.safe_load(pth.read_text("utf-8"))
+        return {"rules": {}, "fallback_category": "Unknown", "case_sensitive": False}
 
-    # ───────── main API ─────────────────────────────────────────────
-    def run(self) -> None:  # slot for QThread
+    @staticmethod
+    def _load_journal(p: Path) -> tuple[set[str], set[str]]:
+        """Возвращает (set-SHA, set-filename_without_ext)."""
+        sha_set, name_set = set(), set()
+        wb = openpyxl.load_workbook(p, read_only=True, data_only=True)
+        ws = wb.active
+        headers = {str(c.value).strip().upper(): i for i, c in enumerate(next(ws.rows))}
+        for row in ws.iter_rows(min_row=2):
+            if "SHA256" in headers:
+                sha_set.add(str(row[headers["SHA256"]].value))
+            if "FILE_NAME" in headers:
+                name_set.add(str(row[headers["FILE_NAME"]].value).upper())
+        return sha_set, name_set
+
+    # ──────────────── public run() ─────────────────────────────
+    def run(self) -> None:
         try:
-            to_process = list(self._iter_files())
-            total = len(to_process)
-            log.info("%d candidate files", total)
-
-            with concurrent.futures.ThreadPoolExecutor() as ex:
-                for rec in ex.map(self._handle_file, to_process):
-                    if self.stop_event.is_set():
-                        break
-                    self.scanned += 1
-                    if rec:
-                        self.records.append(rec)
-                    self.progress.emit(self.scanned, self.uniq, self.dup)
-
+            self._scan()
             if not self.dry:
-                self._export_index()
-            self.message.emit("INFO", "Finished successfully.")
-        except Exception as exc:  # pragma: no cover
-            log.exception("Fatal")
-            self.message.emit("ERROR", str(exc))
+                self._write_index()
+        except Exception:
+            LOG.exception("Unexpected crash")
+            self.stats["errors"] += 1
         finally:
-            self.finished.emit()
+            self.progress_cb({**self.stats, "final": True})
 
-    def _iter_files(self) -> Iterable[Path]:
+    # ──────────────── core scan loop ───────────────────────────
+    def _scan(self) -> None:
         for root in self.src_roots:
-            for p in root.rglob("*"):
-                if p.is_file() and p.suffix.lower() in self.extensions:
-                    yield p
+            for path in root.rglob("*"):
+                if self.cancel.is_set():
+                    return
+                if not path.is_file() or path.suffix.lower() not in ALLOWED_EXTS:
+                    continue
 
-    def _handle_file(self, path: Path) -> Optional[FileRecord]:
-        abbrev = self._match_abbrev(path.stem)
+                self.stats["scanned"] += 1
+                try:
+                    self._handle(path)
+                except Exception as exc:
+                    LOG.error("❌ %s : %s", path.name, exc)
+                    self.stats["errors"] += 1
+
+                if not self.stats["scanned"] % 100:
+                    self.progress_cb(self.stats)
+
+    # ──────────────── single-file processing ───────────────────
+    def _handle(self, path: Path) -> None:
+        abbrev = self.matcher.find(path.name)
         if not abbrev:
-            return None
+            self.stats["skipped"] += 1
+            return
 
-        sha = sha256_file(path)
-        if self.db.has(sha):
-            self.dup += 1
-            return None
+        sha = self._sha256(path)
+        if sha in self.hash_seen or sha in self.journal_sha:
+            LOG.debug("↩︎ dup-SHA  %s", path.name)
+            self.stats["dup"] += 1
+            return
 
-        if path.name in self.journal_names:
-            self.message.emit("INFO", f"Skip (journal present): {path.name}")
-            self.dup += 1
-            return None
+        base_name = path.stem.upper()
+        if (
+            (self.tgt_root / abbrev / path.name).exists()
+            or base_name in self.journal_names
+        ):
+            LOG.debug("↩︎ already indexed %s", path.name)
+            self.stats["dup"] += 1
+            return
 
-        dest_dir = self.target_root / abbrev
+        # ---------------- unique ----------------
+        self.hash_seen[sha] = path
+        self.stats["unique"] += 1
+
+        dest_dir = self.tgt_root / abbrev
         dest_dir.mkdir(parents=True, exist_ok=True)
         dest_path = dest_dir / path.name
-        if dest_path.exists():
-            self.message.emit("INFO", f"Skip (already in target): {dest_path.name}")
-            self.dup += 1
-            return None
 
         if not self.dry:
-            if self.mode_move:
-                shutil.move(path, dest_path)
-                create_shortcut(path.with_suffix(".lnk"), dest_path)
-            else:
+            if self.mode == "copy":
                 shutil.copy2(path, dest_path)
+            else:
+                shutil.move(path, dest_path)
+                if win32com:
+                    self._lnk(path.with_suffix(".lnk"), dest_path)
 
-        text_sample = "" if self.dry else ocr_or_pdf_text(dest_path)[:800]
+        revision = self._revision(path.name)
+        category, tags = self._categorise(path, abbrev)
 
-        rec = FileRecord(
-            abbrev=abbrev,
-            src_path=path,
-            dest_path=dest_path,
-            fmt=path.suffix.lower()[1:],
-            size_mb=round(dest_path.stat().st_size / 2**20, 2) if dest_path.exists() else round(path.stat().st_size / 2**20, 2),
-            mtime=dt.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d"),
-            sha256=sha,
-            revision=guess_revision(path.name),
+        self.rows.append(
+            [
+                abbrev,
+                path.stem,
+                path.suffix.lstrip(".").lower(),
+                revision,
+                category,
+                ", ".join(tags),
+                round(path.stat().st_size / 1048576, 2),
+                datetime.fromtimestamp(path.stat().st_mtime).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                ),
+                sha,
+                f'=HYPERLINK("{dest_path.as_posix()}", "open")',
+            ]
         )
-        rec.category = self.cat.classify(rec, text_sample)
-        self.db.add(rec)
-        self.uniq += 1
-        return rec
 
-    # ───────── index export ─────────────────────────────────────────
-    def _export_index(self) -> None:
+    # ──────────────── helpers ──────────────────────────────────
+    @staticmethod
+    def _sha256(p: Path) -> str:
+        h = hashlib.sha256()
+        with p.open("rb") as f:
+            while chunk := f.read(CHUNK):
+                h.update(chunk)
+        return h.hexdigest()
+
+    @staticmethod
+    def _lnk(link: Path, target: Path) -> None:
+        shell = win32com.client.Dispatch("WScript.Shell")  # type: ignore
+        s = shell.CreateShortCut(str(link))
+        s.Targetpath = str(target)
+        s.WorkingDirectory = str(target.parent)
+        s.save()
+
+    @staticmethod
+    def _revision(fname: str) -> str:
+        m = REV_PAT.search(fname)
+        return (m["rev"].upper()) if m else ""
+
+    # ––– categorisation –––
+    def _categorise(self, p: Path, abbrev: str) -> tuple[str, list[str]]:
+        name = p.stem
+        for cat, val in self.rules.get("rules", {}).items():
+            for trig in val.get("triggers", []):
+                if trig.lower() in name.lower():
+                    return cat, [trig]
+        # OCR / PDF text
+        text = ""
+        try:
+            if p.suffix.lower() == ".pdf" and pdf_text:
+                text = pdf_text(str(p), maxpages=1)
+            elif pytesseract and p.suffix.lower() in {".jpg", ".png", ".tif", ".tiff"}:
+                text = pytesseract.image_to_string(Image.open(p))  # type: ignore
+        except Exception:
+            pass
+        if text:
+            for cat, val in self.rules.get("rules", {}).items():
+                for trig in val.get("triggers", []):
+                    if trig.lower() in text.lower():
+                        return cat, [trig]
+        if self.use_llm:
+            return "LLM-TODO", []
+        return self.rules.get("fallback_category", "Unknown"), []
+
+    # ––– write excel –––
+    def _write_index(self) -> None:
+        out = self.tgt_root / "INDEX.xlsx"
         wb = openpyxl.Workbook()
         ws = wb.active
-        ws.title = "INDEX"
-        header = [
-            "Abbrev",
-            "File_Name",
-            "Format",
-            "Revision",
-            "Category",
-            "Tags",
-            "Size_MB",
-            "Modified",
-            "SHA256",
-            "Link",
-        ]
-        ws.append(header)
-
-        for r in self.records:
-            ws.append([
-                r.abbrev,
-                r.dest_path.name,
-                r.fmt.upper(),
-                r.revision,
-                r.category,
-                ", ".join(r.tags),
-                r.size_mb,
-                r.mtime,
-                r.sha256,
-                f'=HYPERLINK("{r.dest_path.as_posix()}", "OPEN")',
-            ])
-
-        for i, _ in enumerate(header, 1):
-            ws.column_dimensions[get_column_letter(i)].bestFit = True
-        ws.auto_filter = AutoFilter(ref=f"A1:{get_column_letter(len(header))}{len(self.records)+1}")
-        wb.save(self.target_root / EXCEL_NAME)
-
-    # ───────── dumps ────────────────────────────────────────────────
-    def create_dump(self) -> Path:
-        dump_dir = self.target_root / DUMP_DIR
-        dump_dir.mkdir(exist_ok=True)
-        ts = dt.now().strftime("%Y%m%d_%H%M%S")
-        dump = dump_dir / f"dump_{ts}.json"
-        payload = {
-            "records": [r.__dict__ for r in self.records],
-            "db": (self.target_root / DB_NAME).read_bytes().hex(),
-        }
-        dump.write_text(json.dumps(payload, indent=2), "utf-8")
-        return dump
-
-    def restore_dump(self, dump: Path) -> None:
-        obj = json.loads(dump.read_text("utf-8"))
-        for r in obj["records"]:
-            rec = FileRecord(**r)
-            if not rec.dest_path.exists() and rec.src_path.exists():
-                shutil.copy2(rec.src_path, rec.dest_path)
-        (self.target_root / DB_NAME).write_bytes(bytes.fromhex(obj["db"]))
+        ws.title = "Spec Index"
+        ws.append(INDEX_HEADERS)
+        for r in self.rows:
+            ws.append(r)
+        ws.auto_filter.ref = f"A1:{get_column_letter(len(INDEX_HEADERS))}1"
+        for col in range(1, len(INDEX_HEADERS) + 1):
+            ws.column_dimensions[get_column_letter(col)].width = 18
+        wb.save(out)
+        LOG.info("📄 INDEX.xlsx written with %d entries", len(self.rows))
 
 
-# ─────────────────── threading wrapper ───────────────────────────────
+# ═════════════════════════ Qt GUI ════════════════════════════════
+class SyncThread(QThread):
+    status = Signal(dict)
 
-class Worker(QThread):
-    def __init__(self, sync: SpecSync):
+    def __init__(self, cfg: dict):
         super().__init__()
-        self.sync = sync
+        self.cfg = cfg
+        self.worker: Optional[SpecSync] = None
 
-    def run(self):  # noqa: D401
-        self.sync.run()
+    def run(self) -> None:
+        self.worker = SpecSync(**self.cfg, progress_cb=self.status.emit)
+        self.worker.run()
+
+    def stop(self) -> None:
+        if self.worker:
+            self.worker.cancel.set()
 
 
-# ─────────────────── GUI ─────────────────────────────────────────────
-
-class MainWindow(QMainWindow):
-    def __init__(self):
+class MainWin(QMainWindow):
+    def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle(APP_NAME)
-        self.resize(1000, 640)
-        self._build()
-        self.worker: Optional[Worker] = None
-        self.sync: Optional[SpecSync] = None
+        self.setWindowTitle("Spec Sync v1.2")
+        self.resize(880, 600)
+        self.thread: Optional[SyncThread] = None
 
-    def _build(self):
-        central = QWidget(self)
-        self.setCentralWidget(central)
-        main = QVBoxLayout(central)
-
-        # Source group
-        src_grp = QGroupBox("Source roots")
-        src_layout = QVBoxLayout(src_grp)
+        # ––– widgets –––
         self.src_list = QListWidget()
-        btns = QHBoxLayout()
-        btn_add = QPushButton("Add")
-        btn_del = QPushButton("Remove")
-        btn_add.clicked.connect(self._add_src)
-        btn_del.clicked.connect(self._del_src)
-        btns.addWidget(btn_add)
-        btns.addWidget(btn_del)
-        src_layout.addWidget(self.src_list)
-        src_layout.addLayout(btns)
-        main.addWidget(src_grp)
+        btn_add = QPushButton("➕ Add Source")
+        btn_del = QPushButton("🗑 Remove")
 
-        # Target & files group
-        path_grp = QGroupBox("Paths & files")
-        grid = QGridLayout(path_grp)
+        self.tgt_edit = QLineEdit()
+        btn_tgt = QPushButton("Select Target")
 
-        self.target_edit, btn_target = self._mk_browse(grid, "Target root", 0, True)
-        self.abbrev_edit, btn_abbr = self._mk_browse(grid, "abbreviations.txt", 1, False)
-        self.journal_edit, btn_jour = self._mk_browse(grid, "Journal .xlsx (optional)", 2, False)
+        self.abbr_edit = QLineEdit()
+        btn_abbr = QPushButton("abbreviations.txt")
 
-        # extension filter
-        grid.addWidget(QLabel("Extensions (csv, starts with dot):"), 3, 0)
-        self.ext_edit = QLineEdit(",".join(sorted(DEFAULT_EXTS)))
-        grid.addWidget(self.ext_edit, 3, 1)
+        self.journal_edit = QLineEdit()
+        btn_journal = QPushButton("Manual INDEX.xlsx")
 
-        main.addWidget(path_grp)
+        self.case_chk = QCheckBox("Case-sensitive match")
+        self.mode_copy = QRadioButton("Copy")
+        self.mode_move = QRadioButton("Move & Link")
+        self.mode_copy.setChecked(True)
+        self.dry_chk = QCheckBox("Dry-run")
+        self.llm_chk = QCheckBox("Use LLM")
 
-        # options group
-        opt_grp = QGroupBox("Options")
-        opt = QGridLayout(opt_grp)
-        self.rb_copy = QRadioButton("Copy")
-        self.rb_move = QRadioButton("Move + Link")
-        self.rb_copy.setChecked(True)
-        self.chk_case = QRadioButton("Case sensitive abbrev match")
-        self.chk_dry = QRadioButton("Dry‑Run")
-        opt.addWidget(self.rb_copy, 0, 0)
-        opt.addWidget(self.rb_move, 0, 1)
-        opt.addWidget(self.chk_case, 1, 0)
-        opt.addWidget(self.chk_dry, 1, 1)
-        main.addWidget(opt_grp)
+        self.ext_filter = QLineEdit("pdf,tif,tiff,jpg,png,gif")  # new
+        self.btn_start = QPushButton("▶ Start")
+        self.btn_cancel = QPushButton("⏹ Cancel")
+        self.prog = QProgressBar()
 
-        # progress & log
-        self.progress = QProgressBar()
-        self.console = QTextEdit()
-        self.console.setReadOnly(True)
-        main.addWidget(self.progress)
-        main.addWidget(self.console, 2)
+        self.log_box = QTextEdit(readOnly=True)
+        self.status = QStatusBar()
+        self.setStatusBar(self.status)
 
-        # start / cancel
-        h = QHBoxLayout()
-        self.btn_start = QPushButton("Start")
-        self.btn_cancel = QPushButton("Cancel")
-        self.btn_cancel.setEnabled(False)
+        # ––– layout –––
+        left = QVBoxLayout()
+        left.addWidget(QLabel("Source Roots"))
+        left.addWidget(self.src_list)
+        left.addWidget(btn_add)
+        left.addWidget(btn_del)
+
+        right = QVBoxLayout()
+        right.addWidget(QLabel("Target Root"))
+        right.addWidget(self.tgt_edit)
+        right.addWidget(btn_tgt)
+        right.addWidget(QLabel("Abbreviations.txt"))
+        right.addWidget(self.abbr_edit)
+        right.addWidget(btn_abbr)
+        right.addWidget(QLabel("Manual INDEX.xlsx (optional)"))
+        right.addWidget(self.journal_edit)
+        right.addWidget(btn_journal)
+        right.addWidget(self.case_chk)
+        right.addWidget(self.mode_copy)
+        right.addWidget(self.mode_move)
+        right.addWidget(self.dry_chk)
+        right.addWidget(self.llm_chk)
+        right.addWidget(QLabel("Extensions filter (comma)"))
+        right.addWidget(self.ext_filter)
+        right.addWidget(self.prog)
+        btn_row = QHBoxLayout()
+        btn_row.addWidget(self.btn_start)
+        btn_row.addWidget(self.btn_cancel)
+        right.addLayout(btn_row)
+
+        main = QHBoxLayout()
+        main.addLayout(left, 2)
+        main.addLayout(right, 3)
+
+        main_tab = QWidget()         # ← оборачиваем layout в отдельный QWidget
+        main_tab.setLayout(main)
+
+        log_tab = QTabWidget()
+        log_tab.addTab(main_tab, "Sync")   # ← нужен заголовок!
+        log_tab.addTab(self.log_box, "Log")
+
+        central = QVBoxLayout()
+        central.addWidget(log_tab)
+
+        w = QWidget()
+        w.setLayout(central)
+        self.setCentralWidget(w)
+
+        # ––– menu –––
+        m_tools = self.menuBar().addMenu("&Tools")
+        act_dump = QAction("Create Dump (zip)", self)
+        act_restore = QAction("Restore Dump", self)
+        act_open_idx = QAction("Open INDEX.xlsx", self)
+        m_tools.addActions([act_dump, act_restore, act_open_idx])
+
+        # ––– connections –––
+        btn_add.clicked.connect(self._src_add)
+        btn_del.clicked.connect(lambda: self._rm_selected(self.src_list))
+        btn_tgt.clicked.connect(lambda: self._pick_folder(self.tgt_edit))
+        btn_abbr.clicked.connect(lambda: self._pick_file(self.abbr_edit, "*.txt"))
+        btn_journal.clicked.connect(lambda: self._pick_file(self.journal_edit, "*.xlsx"))
         self.btn_start.clicked.connect(self._start)
         self.btn_cancel.clicked.connect(self._cancel)
-        h.addWidget(self.btn_start)
-        h.addWidget(self.btn_cancel)
-        main.addLayout(h)
+        act_dump.triggered.connect(self._dump)
+        act_restore.triggered.connect(self._restore)
+        act_open_idx.triggered.connect(self._open_index)
 
-        # menu safety
-        m_tools = self.menuBar().addMenu("Tools")
-        act_dump = QAction("Create dump", self)
-        act_rest = QAction("Restore dump", self)
-        act_dump.triggered.connect(self._mk_dump)
-        act_rest.triggered.connect(self._restore_dump)
-        m_tools.addAction(act_dump)
-        m_tools.addAction(act_rest)
+    # ––– ui helpers –––
+    def _src_add(self) -> None:
+        d = QFileDialog.getExistingDirectory(self, "Choose Source folder")
+        if d:
+            self.src_list.addItem(QListWidgetItem(d))
 
-    def _mk_browse(self, grid: QGridLayout, label: str, row: int, dir_: bool) -> tuple[QLineEdit, QPushButton]:
-        grid.addWidget(QLabel(label + ":"), row, 0)
-        edit = QLineEdit()
-        btn = QPushButton("…")
-        def cb():
-            if dir_:
-                p = QFileDialog.getExistingDirectory(self, label)
-            else:
-                p, _ = QFileDialog.getOpenFileName(self, label)
-            if p:
-                edit.setText(p)
-        btn.clicked.connect(cb)
-        grid.addWidget(edit, row, 1)
-        grid.addWidget(btn, row, 2)
-        return edit, btn
+    def _rm_selected(self, lw: QListWidget) -> None:
+        for idx in lw.selectedIndexes():
+            lw.takeItem(idx.row())
 
-    # ───────── interaction slots ────────────────────────────────────
-    def _add_src(self):
-        p = QFileDialog.getExistingDirectory(self, "Select folder")
-        if p:
-            self.src_list.addItem(QListWidgetItem(p))
+    def _pick_folder(self, edit: QLineEdit) -> None:
+        d = QFileDialog.getExistingDirectory(self, "Pick folder")
+        if d:
+            edit.setText(d)
 
-    def _del_src(self):
-        for i in self.src_list.selectedItems():
-            self.src_list.takeItem(self.src_list.row(i))
+    def _pick_file(self, edit: QLineEdit, flt: str) -> None:
+        f, _ = QFileDialog.getOpenFileName(self, "Pick file", filter=flt)
+        if f:
+            edit.setText(f)
 
-    def _log(self, lvl: str, txt: str):
-        colour = {"INFO": "black", "ERROR": "red", "DEBUG": "gray"}.get(lvl, "black")
-        self.console.append(f'<span style="color:{colour}">[{lvl}] {txt}</span>')
+    # ––– main workflow –––
+    def _cfg(self) -> dict | None:
+        srcs = [Path(self.src_list.item(i).text()) for i in range(self.src_list.count())]
+        if not srcs:
+            QMessageBox.warning(self, "Need sources", "Add at least one source!")
+            return None
+        tgt = Path(self.tgt_edit.text())
+        if not tgt.exists():
+            QMessageBox.warning(self, "Target", "Valid target folder required")
+            return None
+        abbr = Path(self.abbr_edit.text())
+        if not abbr.exists():
+            QMessageBox.warning(self, "Abbrev", "Select abbreviations.txt")
+            return None
 
-    def _start(self):
-        if self.worker and self.worker.isRunning():
-            return
+        exts = {f".{e.strip().lower()}" for e in self.ext_filter.text().split(",") if e.strip()}
+        if exts:
+            global ALLOWED_EXTS  # override runtime
+            ALLOWED_EXTS = exts
 
-        # validation
-        if not self.src_list.count():
-            QMessageBox.warning(self, APP_NAME, "Add at least one source root")
-            return
-        t_root = Path(self.target_edit.text())
-        abbr = Path(self.abbrev_edit.text())
-        if not t_root.exists():
-            QMessageBox.warning(self, APP_NAME, "Target path invalid")
-            return
-        if not abbr.is_file():
-            QMessageBox.warning(self, APP_NAME, "abbreviations.txt missing")
-            return
-
-        exts = {e.strip() for e in self.ext_edit.text().split(',') if e.strip()}
-
-        self.sync = SpecSync(
-            src_roots=[Path(self.src_list.item(i).text()) for i in range(self.src_list.count())],
-            target_root=t_root,
-            abbr_file=abbr,
-            case_sensitive=self.chk_case.isChecked(),
-            mode_move=self.rb_move.isChecked(),
-            rules_file=Path(DEFAULT_RULES),
+        cfg = dict(
+            source_roots=srcs,
+            target_root=tgt,
+            abbreviations_file=abbr,
+            rules_file=Path("rules.yaml") if Path("rules.yaml").exists() else None,
             journal_file=Path(self.journal_edit.text()) if self.journal_edit.text() else None,
-            extensions=exts,
-            dry_run=self.chk_dry.isChecked(),
+            mode="move" if self.mode_move.isChecked() else "copy",
+            case_sensitive=self.case_chk.isChecked(),
+            use_llm=self.llm_chk.isChecked(),
+            dry_run=self.dry_chk.isChecked(),
         )
-        self.sync.progress.connect(self._update)
-        self.sync.message.connect(self._log)
-        self.worker = Worker(self.sync)
-        self.worker.finished.connect(lambda: self._toggle(False))
-        self._toggle(True)
-        self.worker.start()
+        return cfg
 
-    def _toggle(self, running: bool):
-        self.btn_start.setEnabled(not running)
-        self.btn_cancel.setEnabled(running)
-
-    def _cancel(self):
-        if self.sync:
-            self.sync.stop_event.set()
-        if self.worker:
-            self.worker.quit()
-        self._toggle(False)
-
-    def _update(self, scanned: int, uniq: int, dup: int):
-        self.progress.setValue(scanned)
-        self.progress.setMaximum(scanned + dup + uniq)
-        self.statusBar().showMessage(f"Scanned: {scanned}  Unique: {uniq}  Dup: {dup}")
-
-    def _mk_dump(self):
-        if not self.sync:
+    def _start(self) -> None:
+        if self.thread and self.thread.isRunning():
+            QMessageBox.warning(self, "Busy", "Sync already running.")
             return
-        p = self.sync.create_dump()
-        QMessageBox.information(self, APP_NAME, f"Dump saved: {p}")
+        cfg = self._cfg()
+        if not cfg:
+            return
+        self.prog.setRange(0, 0)
+        self.log_box.clear()
+        self.thread = SyncThread(cfg)
+        self.thread.status.connect(self._status)
+        self.thread.finished.connect(self._done)
+        self.thread.start()
 
-    def _restore_dump(self):
-        p, _ = QFileDialog.getOpenFileName(self, "Select dump", str(Path.cwd()))
-        if p and self.sync:
-            self.sync.restore_dump(Path(p))
-            QMessageBox.information(self, APP_NAME, "Restored")
+    def _cancel(self) -> None:
+        if self.thread:
+            self.thread.stop()
 
-    def closeEvent(self, ev):  # noqa: N802
-        if self.worker and self.worker.isRunning():
-            self._cancel()
-            self.worker.wait(2000)
-        ev.accept()
-
-
-# ─────────────────── CLI entry ───────────────────────────────────────
-
-def parse_cli() -> argparse.Namespace:
-    p = argparse.ArgumentParser(APP_NAME)
-    p.add_argument("src", nargs="*", type=Path)
-    p.add_argument("--target", type=Path, required=True)
-    p.add_argument("--abbr", type=Path, required=True)
-    p.add_argument("--journal", type=Path)
-    p.add_argument("--move", action="store_true")
-    p.add_argument("--case", action="store_true")
-    p.add_argument("--dry", action="store_true")
-    p.add_argument("--ext", type=str, help="Comma list of extensions, e.g. .pdf,.tiff")
-    return p.parse_args()
-
-
-def main():
-    if len(sys.argv) > 1 and sys.argv[1] == "--cli":
-        ns = parse_cli()
-        sync = SpecSync(
-            src_roots=ns.src,
-            target_root=ns.target,
-            abbr_file=ns.abbr,
-            case_sensitive=ns.case,
-            mode_move=ns.move,
-            rules_file=Path(DEFAULT_RULES),
-            journal_file=ns.journal,
-            extensions={e.strip() for e in (ns.ext.split(',') if ns.ext else DEFAULT_EXTS)},
-            dry_run=ns.dry,
+    # ––– signals –––
+    @Slot(dict)
+    def _status(self, st: dict) -> None:
+        msg = (
+            f'Scanned {st["scanned"]}  '
+            f'Unique {st["unique"]}  Dup {st["dup"]}  '
+            f'Skipped {st["skipped"]}  Err {st["errors"]}'
         )
-        sync.run()
-        return
+        self.status.showMessage(msg)
+        self.log_box.append(msg)
 
-    app = QApplication.instance() or QApplication(sys.argv)
-    win = MainWindow()
-    win.show()
-    sys.exit(app.exec())
+    def _done(self) -> None:
+        self.prog.setRange(0, 1)
+        QMessageBox.information(self, "Done", "Sync finished")
+
+    # ––– tools –––
+    def _dump(self) -> None:
+        tgt = Path(self.tgt_edit.text())
+        if not tgt.exists():
+            return
+        dump, _ = QFileDialog.getSaveFileName(self, "Dump path", "specs_dump.zip")
+        if not dump:
+            return
+        with zipfile.ZipFile(dump, "w", zipfile.ZIP_DEFLATED) as z:
+            for p in tgt.rglob("*"):
+                z.write(p, p.relative_to(tgt))
+        QMessageBox.information(self, "Dump", "ZIP created")
+
+    def _restore(self) -> None:
+        tgt = Path(self.tgt_edit.text())
+        if not tgt.exists():
+            return
+        dump, _ = QFileDialog.getOpenFileName(self, "Select dump", filter="*.zip")
+        if not dump:
+            return
+        with zipfile.ZipFile(dump) as z:
+            z.extractall(tgt)
+        QMessageBox.information(self, "Restore", "Dump restored")
+
+    def _open_index(self) -> None:
+        idx = Path(self.tgt_edit.text()) / "INDEX.xlsx"
+        if idx.exists():
+            os.startfile(idx)  # Windows
+
+
+# ═════════════════════════ CLI entry ═════════════════════════════
+def cli() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("source", nargs="+", type=Path)
+    ap.add_argument("-t", "--target", required=True, type=Path)
+    ap.add_argument("-a", "--abbrev", required=True, type=Path)
+    ap.add_argument("-j", "--journal", type=Path)
+    ap.add_argument("-m", "--mode", choices=["copy", "move"], default="copy")
+    ap.add_argument("--ci", help="case-insensitive", action="store_true")
+    ap.add_argument("--dry", action="store_true")
+    args = ap.parse_args()
+
+    ss = SpecSync(
+        source_roots=args.source,
+        target_root=args.target,
+        abbreviations_file=args.abbrev,
+        journal_file=args.journal,
+        mode=args.mode,
+        case_sensitive=not args.ci,
+        dry_run=args.dry,
+    )
+    ss.run()
 
 
 if __name__ == "__main__":
-    main()
+    if sys.stdin.isatty():  # launched by double-click
+        app = QApplication(sys.argv)
+        MainWin().show()
+        sys.exit(app.exec())
+    cli()
+
+# ────────────────────────── CHANGELOG ────────────────────────────
+# v1.2 (2025-05-26)
+#   • Аббревиатуры длиной 1-2 символа + знаки +/-
+#   • Сверка с Target-папкой и ручным INDEX.xlsx
+#   • Фильтр расширений в GUI
+#   • Открыть INDEX.xlsx из меню
+#   • Улучшенные логи, stats, colours
