@@ -1,0 +1,16 @@
+{
+  "version": "8.2",
+  "default_file_formats": "pdf, doc, docx, tif, tiff, dwg, xls, xlsx, gif, jpg, JPG",
+  "catalog_filename": "specifications_catalog.xlsx",
+  "unknown_folder": "_UNKNOWN",
+  "corrupt_folder": "_CORRUPT",
+  "office_temp_prefix": "~$",
+  "default_max_workers": 4,
+  "hash_mode": "full",
+  "max_retry_attempts": 3,
+  "retry_delay_sec": 0.5,
+  "gui_update_batch_size": 50,
+  "log_file": "specsorter.log",
+  "log_level": "INFO",
+  "force_uppercase_names": true
+}

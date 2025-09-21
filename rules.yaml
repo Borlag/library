@@ -1,14 +1,47 @@
-fallback_category: Unknown
-case_sensitive: false
+detect:
+  # QPL
+  - name: QPL
+    priority: 300
+    pattern: '^(?:QPL)(?:[\s_-]*to)?[\s_-]*([A-Z]{2,4})[\s_-]*(.+)$'
+    folder_from_group: 1
+    original_abbrev: 'QPL'
 
-rules:
-  Materials:
-    triggers: ["AMS", "ASTM", "AISI", "ISO MTR"]
-  Processes:
-    triggers: ["BAC", "MIL-STD", "SAE ARP", "CIP"]
-  Coatings:
-    triggers: ["QQ-P", "PRIMER", "PAINT", "ANOD"]
-  Fasteners:
-    triggers: ["NAS", "MS", "AN", "LN", "EN"]
-  Testing & QA:
-    triggers: ["NDT", "DYE PEN", "UT", "EDDY", "SHEAR TEST"]
+  # AMS
+  - name: AMS
+    priority: 200
+    pattern: '^(?:SAE[\s_-]*)?AMS[-\sA-Z0-9_]+'
+    folder: 'AMS'
+    original_abbrev: 'AMS'
+
+  # DIN combos
+  - name: DIN EN ISO
+    priority: 160
+    pattern: '^DIN(?:\s*|_|-)*EN(?:\s*|_|-)*ISO'
+    folder: 'DIN'
+    original_abbrev: 'DIN EN ISO'
+
+  # ISO IEC / ISO SAE / ISO
+  - name: ISO IEC
+    priority: 130
+    pattern: '^ISO(?:\s*|_|-)*IEC'
+    folder: 'ISO'
+    original_abbrev: 'ISO IEC'
+
+  - name: ISO
+    priority: 110
+    pattern: '^ISO(?:\s*|_|-|\\.)*\\d'
+    folder: 'ISO'
+    original_abbrev: 'ISO'
+
+  - name: BAC family specific
+    priority: 195
+    pattern: '^(BAC[BCDFIJLNPRSVW])'
+    folder_from_group: 1
+    original_abbrev_from_group: 1
+
+  - name: BAC generic
+    priority: 120
+    pattern: '^BAC[\\s\\-A-Z0-9_]+'
+    folder: 'BAC'
+    original_abbrev: 'BAC'
+
