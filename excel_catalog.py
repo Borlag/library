@@ -111,31 +111,58 @@ class ExcelCatalog:
     # --- Извлечение ревизии ---
     def _extract_revision(self, display_name: str, filename_no_ext: str) -> str:
         """
-        Грубые, но практичные правила:
-        - REV / REVISION + токен (буква/цифры)
-        - Окончание '/N' или '_N' (для AMS: N <= 2 символа) -> N
-        - Окончание на одиночную букву для AMS/Многих SAE (например, "...-416F") -> буква
-        - Год вида 19xx/20xx -> принимаем как ревизию при отсутствии других признаков
+        Расширенное извлечение ревизии.
+        Поддерживаем распространённые варианты:
+        - REV / REVISION / REV. / REV: / REVISION: + суффикс
+        - ISSUE / ED(ITION) / CHG / CHANGE / AMDT / AMENDMENT / MOD + суффикс
+        - BACR15GA_REV.K -> "K" (учёт точек/подчёркиваний)
+        - Окончание '_X' или '-X' для QPL/REV имен (например, "BMS10-103 QPL_D")
+        - AMSXXXX/XX -> "XX"
+        - Одиночная буква на конце обозначения ("...-416F") как запасной вариант
+        - Год (19xx/20xx) как последний fallback
         """
+
+        contexts = [filename_no_ext.upper(), display_name.upper()]
+        keyword_patterns = [
+            r'\bREV(?:ISION)?[\s._-]*([A-Z0-9]+)\b',
+            r'\bREV\.[\s._-]*([A-Z0-9]+)\b',
+            r'\bREV:[\s._-]*([A-Z0-9]+)\b',
+            r'\bISSUE[\s._-]*([A-Z0-9]+)\b',
+            r'\bED(?:ITION)?[\s._-]*([A-Z0-9]+)\b',
+            r'\bCHG[\s._-]*([A-Z0-9]+)\b',
+            r'\bCHANGE[\s._-]*([A-Z0-9]+)\b',
+            r'\bAMDT[\s._-]*([A-Z0-9]+)\b',
+            r'\bAMEND(?:MENT)?[\s._-]*([A-Z0-9]+)\b',
+            r'\bMOD(?:IFICATION)?[\s._-]*([A-Z0-9]+)\b',
+        ]
+
+        for ctx in contexts:
+            for pat in keyword_patterns:
+                m = re.search(pat, ctx)
+                if m:
+                    return m.group(1).strip('-_.')
+
         s = display_name.upper()
         fn = filename_no_ext.upper()
 
-        # 1) Явные REV/REVISION
-        m = re.search(r'\bREV(?:ISION)?\s*([A-Z0-9\-]+)\b', fn)
-        if m:
-            return m.group(1)
-
-        # 2) AMS: '/N' или '_N' в конце display
+        # AMS: '/N' или '_N' в конце display
         m = re.search(r'/([A-Z0-9]{1,2})$', s)
         if m:
             return m.group(1)
 
-        # 3) AMS/SAE буква на конце кода "...-416F"
+        # QPL и подобные: окончание '_X' или '-X' после упоминания REV/QPL
+        tail_candidates = [fn, s]
+        for ctx in tail_candidates:
+            tail = re.search(r'[_-]([A-Z]{1,3})$', ctx)
+            if tail and any(token in ctx for token in ('QPL', 'REV', 'ISSUE', 'ED', 'EDITION', 'CHG', 'CHANGE', 'AMDT', 'AMEND', 'MOD')):
+                return tail.group(1)
+
+        # AMS/SAE буква на конце кода "...-416F"
         m = re.search(r'-[0-9A-Z]+([A-Z])$', s)
         if m:
             return m.group(1)
 
-        # 4) Год (как fallback)
+        # Год (как fallback)
         m = re.search(r'\b(19\d{2}|20\d{2})\b', fn)
         if m:
             return m.group(1)
@@ -156,6 +183,8 @@ class ExcelCatalog:
             if looks_like_office_temp(filename, self.config.office_temp_prefix):
                 continue
             if filename == self.config.catalog_filename:
+                continue
+            if filename.upper().startswith("AUDIT_REPORT"):
                 continue
 
             base, ext = os.path.splitext(filename)
