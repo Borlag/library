@@ -51,6 +51,93 @@ class FileNameFormatter:
     def _squash_spaces(self, s: str) -> str:
         return re.sub(r'\s+', ' ', s).strip()
 
+    def _normalize_aipi(self, name: str) -> str:
+        """AIPIХХ-ХХ-ХХХ без пробела после префикса."""
+        m = re.match(r'^(?i:AIPI)\D*(\d{2})\D*(\d{2})\D*(\d{3,})', name)
+        if m:
+            return f"AIPI{m.group(1)}-{m.group(2)}-{m.group(3)}"
+        return re.sub(r'^(?i:AIPI)\s+', 'AIPI', name)
+
+    def _normalize_qpl_name(self, name: str) -> str:
+        """
+        Приводит QPL-имена к шаблону «<BASE> QPL [REV ... | ...]».
+        - отделяет QPL от базового обозначения (BMS8-79_QPL -> BMS8-79 QPL)
+        - для файлов «QPL BMS…» переставляет QPL в конец
+        - нормализует ревизии: «_D» -> «REV D», «REV.» -> «REV» и т.п.
+        - удаляет лишние маркеры вроде «TO»/«SAE», которые встречаются в исходниках
+        """
+
+        if 'QPL' not in name.upper():
+            return name
+
+        working = name.replace('_', ' ')
+        working = re.sub(r'(?i)REV[\.:]', 'REV ', working)
+        working = re.sub(r'(?i)ISSUE[\.:]', 'ISSUE ', working)
+        working = re.sub(r'(?i)([A-Z0-9])[\s._-]*QPL', r'\1 QPL', working)
+        working = re.sub(r'(?i)QPL[\s._-]*([A-Z0-9])', r'QPL \1', working)
+        tokens = re.split(r'\s+', working.strip())
+        if not tokens:
+            return name
+
+        skip_words = {'QPL', 'TO', 'TO:', 'SAE', 'SPEC', 'STANDARD', 'STD'}
+        base_idx = -1
+        for idx, tok in enumerate(tokens):
+            upper_tok = tok.upper().strip('.')
+            if upper_tok in skip_words:
+                continue
+            if any(ch.isdigit() for ch in tok):
+                base_idx = idx
+                break
+        if base_idx == -1:
+            for idx, tok in enumerate(tokens):
+                if tok.upper() not in skip_words:
+                    base_idx = idx
+                    break
+        if base_idx == -1:
+            base_idx = 0
+
+        base_token = tokens[base_idx]
+        rest_tokens = [tok for idx, tok in enumerate(tokens) if idx != base_idx and tok.upper() not in skip_words]
+
+        cleaned_rest = []
+        keyword_map = {
+            'REVISION': 'REV',
+            'REV.': 'REV',
+            'REVISION:': 'REV',
+            'REV:': 'REV',
+        }
+        revision_keywords = {'REV', 'ISSUE', 'ED', 'EDITION', 'CHG', 'CHANGE', 'AMDT', 'AMENDMENT', 'MOD'}
+        for token in rest_tokens:
+            token = token.strip()
+            if not token:
+                continue
+            stripped = token.rstrip('.,;:')
+            mapped = keyword_map.get(stripped.upper(), stripped)
+            upper = mapped.upper()
+            if upper.startswith('ISSUE') and len(upper) > len('ISSUE'):
+                suffix = mapped[len('ISSUE'):].strip()
+                if suffix and re.fullmatch(r'[A-Z0-9]{1,3}', suffix.upper()):
+                    cleaned_rest.append('ISSUE')
+                    cleaned_rest.append(suffix)
+                    continue
+            if upper.startswith('REV') and len(upper) > len('REV') and upper not in revision_keywords:
+                suffix = mapped[len('REV'):].strip('-_. ')
+                if suffix and re.fullmatch(r'[A-Z0-9]{1,3}', suffix.upper()):
+                    cleaned_rest.append('REV')
+                    cleaned_rest.append(suffix)
+                    continue
+            if mapped:
+                cleaned_rest.append(mapped)
+
+        if cleaned_rest:
+            first = cleaned_rest[0].upper()
+            if first not in revision_keywords and re.fullmatch(r'[A-Z]{1,3}', first):
+                cleaned_rest.insert(0, 'REV')
+
+        ordered = [base_token] + (['QPL'] if 'QPL' not in base_token.upper() else []) + cleaned_rest
+        normalized = ' '.join(ordered)
+        return normalized
+
     def _ensure_tan_spacing(self, name: str) -> str:
         """
         Для TAN: "TAN XXX X" — пробел после TAN и после трёх цифр.
@@ -77,7 +164,9 @@ class FileNameFormatter:
         name = re.sub(r'^(?i:SAE)[\s_-]*', '', name).strip()
 
         # AIPI / AN / ARP: без пробела после префикса
-        if folder_up in ('AIPI', 'AN', 'ARP'):
+        if folder_up == 'AIPI':
+            name = self._normalize_aipi(name)
+        elif folder_up in ('AN', 'ARP'):
             name = re.sub(rf'^(?i:{folder_up})\s+', folder_up, name)
 
         # BAC, DAN, LN, MS, NAS, HST: без пробела
@@ -165,20 +254,7 @@ class FileNameFormatter:
                 name = re.sub(r'^(?i:BS)[\s_-]+', 'BS ', name)
 
         # --- QPL: особая логика ---
-        if orig_up == 'QPL':
-            original_name = name
-            cleaned = re.sub(r'^(?i:QPL)(?:[\s_-]*to)?[\s_-]*', '', name).strip()
-            # целевые префиксы
-            if re.match(r'^(?i:(AMS|BMS|MIL|ASTM|BAC[A-Z]?|NAS|MS|LN|ISO|DIN|ASME|FED|QQ|TN|ASD|AWS|PDS))\b', cleaned):
-                name = cleaned
-                if not name.upper().endswith('.QPL'):
-                    name = f"{name}.QPL"
-            else:
-                name = original_name  # без добавления .QPL
-            name = self._squash_spaces(name)
-            if self.force_uppercase:
-                name = name.upper()
-            return name + ext
+        name = self._normalize_qpl_name(name)
 
         # Гарантируем верхний регистр ряда префиксов
         for pref in self.ABBREVS_TO_UPPERCASE:
