@@ -73,9 +73,23 @@ class FileNameFormatter:
         working = name.replace('_', ' ')
         working = re.sub(r'(?i)REV[\.:]', 'REV ', working)
         working = re.sub(r'(?i)ISSUE[\.:]', 'ISSUE ', working)
+        working = re.sub(r'(?i)QPL\s*(?:TO|TO:)', 'QPL TO ', working)
         working = re.sub(r'(?i)([A-Z0-9])[\s._-]*QPL', r'\1 QPL', working)
         working = re.sub(r'(?i)QPL[\s._-]*([A-Z0-9])', r'QPL \1', working)
-        tokens = re.split(r'\s+', working.strip())
+        tokens_raw = re.split(r'\s+', working.strip())
+        tokens: List[str] = []
+        for tok in tokens_raw:
+            if not tok:
+                continue
+            upper_tok = tok.upper()
+            if upper_tok.startswith('TO') and len(tok) > 2:
+                remainder = tok[2:]
+                remainder = remainder.lstrip(':-._')
+                tokens.append(tok[:2])
+                if remainder:
+                    tokens.append(remainder)
+                continue
+            tokens.append(tok)
         if not tokens:
             return name
 
@@ -137,6 +151,46 @@ class FileNameFormatter:
         ordered = [base_token] + (['QPL'] if 'QPL' not in base_token.upper() else []) + cleaned_rest
         normalized = ' '.join(ordered)
         return normalized
+
+    def _format_bms_ams_qpl(self, name: str) -> str:
+        if 'QPL' not in name.upper():
+            return name
+
+        # Разворачиваем все вхождения ".QPL" и " QPL" в единый маркер
+        collapsed = re.sub(r'(?i)\.?\s*QPL\b', ' QPL ', name)
+        collapsed = re.sub(r'\s+', ' ', collapsed).strip()
+        tokens = collapsed.split(' ')
+        if not tokens:
+            return name
+
+        qpl_idx = next((i for i, tok in enumerate(tokens) if tok.upper() == 'QPL'), -1)
+        if qpl_idx == -1:
+            return name
+
+        base_tokens = tokens[:qpl_idx]
+        suffix_tokens = tokens[qpl_idx + 1:]
+
+        base = ' '.join(base_tokens).strip()
+        revision = ' '.join(suffix_tokens).strip()
+
+        base = re.sub(r'(?i)\.?\s*QPL\b', '', base).strip()
+        revision = re.sub(r'(?i)\.?\s*QPL\b', '', revision).strip()
+
+        combined = ' '.join([part for part in (base, revision) if part])
+        combined = combined.strip(' .')
+        if not combined:
+            combined = base or revision or ''
+
+        if not combined:
+            return 'QPL'
+
+        combined = re.sub(r'\s+', ' ', combined).strip()
+        formatted = combined.rstrip('. ')
+        formatted = re.sub(r'(?i)(?:\.\s*QPL)+$', '', formatted).strip()
+        if formatted.upper().endswith('.QPL'):
+            formatted = formatted[:-4].rstrip()
+
+        return f"{formatted}.QPL"
 
     def _ensure_tan_spacing(self, name: str) -> str:
         """
@@ -255,6 +309,9 @@ class FileNameFormatter:
 
         # --- QPL: особая логика ---
         name = self._normalize_qpl_name(name)
+
+        if folder_up in {'BMS', 'AMS'}:
+            name = self._format_bms_ams_qpl(name)
 
         # Гарантируем верхний регистр ряда префиксов
         for pref in self.ABBREVS_TO_UPPERCASE:

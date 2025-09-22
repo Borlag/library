@@ -315,7 +315,18 @@ class FileProcessor:
     def _collect_audit_actions(self) -> List[FileAction]:
         dest = self.config.destination_folder
         all_tuples = scan_all_files_recursive(dest)
-        filepaths = [t[0] for t in all_tuples if not looks_like_office_temp(t[2], self.config.office_temp_prefix) and not t[2].lower().endswith('.xlsx')]
+        corrupt_norm = os.path.normcase(self.config.corrupt_folder)
+        filepaths = []
+        for fp, _parent_folder, filename in all_tuples:
+            if looks_like_office_temp(filename, self.config.office_temp_prefix):
+                continue
+            if filename.lower().endswith('.xlsx'):
+                continue
+            # Игнорируем файлы внутри папки CORRUPT
+            parts_norm = [os.path.normcase(part) for part in Path(fp).parts]
+            if corrupt_norm in parts_norm:
+                continue
+            filepaths.append(fp)
         self._log(f"Найдено {len(filepaths)} файлов для проверки...")
         self.progress_queue.put({"type":"scan_complete","value":len(filepaths)})
 

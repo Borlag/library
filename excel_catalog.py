@@ -2,6 +2,7 @@ import os
 import csv
 import re
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, Optional
 
 import openpyxl
@@ -179,12 +180,17 @@ class ExcelCatalog:
         link_font = Font(color="0000FF", underline="single")
         row_count_added = 0
 
+        corrupt_norm = os.path.normcase(self.config.corrupt_folder)
+
         for filepath, folder_name, filename in all_files:
             if looks_like_office_temp(filename, self.config.office_temp_prefix):
                 continue
             if filename == self.config.catalog_filename:
                 continue
             if filename.upper().startswith("AUDIT_REPORT"):
+                continue
+            parts_norm = [os.path.normcase(part) for part in Path(filepath).parts]
+            if corrupt_norm in parts_norm:
                 continue
 
             base, ext = os.path.splitext(filename)
