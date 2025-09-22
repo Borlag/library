@@ -57,14 +57,22 @@ class FileProcessor:
         try:
             with open(self.config.abbreviations_file, 'r', encoding='utf-8') as f:
                 self.abbreviations = sorted([line.strip() for line in f if line.strip()], key=len, reverse=True)
-            # Основной паттерн
-            abbrev_pattern = r'^(?:SAE[\s_-]*)?(' + '|'.join(re.escape(a) for a in self.abbreviations) + r')(?![a-zA-Z])'
-            self.abbrev_search_pattern = re.compile(abbrev_pattern, re.IGNORECASE)
-            # Базовые аббревиатуры с суффиксом
-            base_list = [a for a in self.abbreviations if a.upper() in self.ACRONYMS_TREATED_AS_BASE]
-            if base_list:
-                base_pattern = r'^(?:SAE[\s_-]*)?(' + '|'.join(re.escape(a) for a in base_list) + r')([A-Z]+)'
-                self.base_abbrev_pattern = re.compile(base_pattern, re.IGNORECASE)
+
+            if self.abbreviations:
+                # Основной паттерн
+                abbrev_pattern = r'^(?:SAE[\s_-]*)?(' + '|'.join(re.escape(a) for a in self.abbreviations) + r')(?![a-zA-Z])'
+                self.abbrev_search_pattern = re.compile(abbrev_pattern, re.IGNORECASE)
+
+                # Базовые аббревиатуры с суффиксом
+                base_list = [a for a in self.abbreviations if a.upper() in self.ACRONYMS_TREATED_AS_BASE]
+                if base_list:
+                    base_pattern = r'^(?:SAE[\s_-]*)?(' + '|'.join(re.escape(a) for a in base_list) + r')([A-Z]+)'
+                    self.base_abbrev_pattern = re.compile(base_pattern, re.IGNORECASE)
+            else:
+                self.abbrev_search_pattern = None
+                self.base_abbrev_pattern = None
+                self._log("Файл аббревиатур пуст. Автоопределение будет выполняться только по правилам.", "WARNING")
+
             self._patterns_initialized = True
             self._log(f"Паттерны инициализированы. Загружено {len(self.abbreviations)} аббревиатур.")
         except FileNotFoundError:
@@ -86,9 +94,11 @@ class FileProcessor:
 
         # 2) точное совпадение из списка
         if self.abbrev_search_pattern and (m := self.abbrev_search_pattern.search(filename)):
-            detected = m.group(1)
-            if self.rules_engine.is_valid_standard(filename, detected, detected):
-                return detected.split()[0].upper(), detected
+            detected = (m.group(1) or "").strip()
+            if detected and self.rules_engine.is_valid_standard(filename, detected, detected):
+                folder_token = detected.split()[0].upper()
+                if folder_token:
+                    return folder_token, detected
 
         # 3) базовые с суффиксом
         if self.base_abbrev_pattern and (bm := self.base_abbrev_pattern.search(filename)):
@@ -245,6 +255,7 @@ class FileProcessor:
                 create_shortcut_inplace(source_path, final_dest, self.logger)
             except Exception as e:
                 self._log(f"Не удалось создать ярлык: {e}", "ERROR")
+                raise
 
         return True
 

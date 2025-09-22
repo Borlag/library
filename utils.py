@@ -90,6 +90,12 @@ def create_shortcut_inplace(source_path: str, target_path: str, logger: logging.
 def scan_all_files_recursive(path: str) -> List[Tuple[str, str, str]]:
     """Возвращает список (fullpath, parent_folder_name, filename)."""
     result: List[Tuple[str, str, str]] = []
+
+    if os.path.isfile(path):
+        parent = os.path.basename(os.path.dirname(path))
+        result.append((path, parent, os.path.basename(path)))
+        return result
+
     try:
         with os.scandir(path) as it:
             for entry in it:
@@ -97,7 +103,7 @@ def scan_all_files_recursive(path: str) -> List[Tuple[str, str, str]]:
                     result.extend(scan_all_files_recursive(entry.path))
                 else:
                     result.append((entry.path, os.path.basename(path), entry.name))
-    except (PermissionError, FileNotFoundError):
+    except (PermissionError, FileNotFoundError, NotADirectoryError):
         pass
     return result
 
