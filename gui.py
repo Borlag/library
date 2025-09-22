@@ -265,7 +265,8 @@ class Application(tk.Frame):
             corrupt_folder=self.config_dict.get("corrupt_folder","_CORRUPT"),
             catalog_filename=self.config_dict.get("catalog_filename","specifications_catalog.xlsx"),
             office_temp_prefix=self.config_dict.get("office_temp_prefix","~$"),
-            force_uppercase_names=bool(self.config_dict.get("force_uppercase_names", True))
+            force_uppercase_names=bool(self.config_dict.get("force_uppercase_names", True)),
+            hash_mode=self.hash_mode_var.get()
         )
         self._prepare_and_run("run_sorting_only", cfg)
 
@@ -283,7 +284,8 @@ class Application(tk.Frame):
             corrupt_folder=self.config_dict.get("corrupt_folder","_CORRUPT"),
             catalog_filename=self.config_dict.get("catalog_filename","specifications_catalog.xlsx"),
             office_temp_prefix=self.config_dict.get("office_temp_prefix","~$"),
-            force_uppercase_names=bool(self.config_dict.get("force_uppercase_names", True))
+            force_uppercase_names=bool(self.config_dict.get("force_uppercase_names", True)),
+            hash_mode=self.hash_mode_var.get()
         )
         self._prepare_and_run("run_catalog_only", cfg)
 
@@ -294,7 +296,7 @@ class Application(tk.Frame):
             destination_folder=self.destination_folder.get(),
             abbreviations_file=self.abbreviations_file.get(),
             dry_run=self.dry_run_mode.get(),
-            rename_on_audit=self.rename_on_audit.get() or self.move_corrupt.get(),
+            rename_on_audit=self.rename_on_audit.get(),
             rules_file=self.rules_file.get() or None,
             max_workers=int(self.max_workers_var.get() or 4),
             audit_report=self.save_audit_report.get(),
@@ -303,7 +305,8 @@ class Application(tk.Frame):
             corrupt_folder=self.config_dict.get("corrupt_folder","_CORRUPT"),
             catalog_filename=self.config_dict.get("catalog_filename","specifications_catalog.xlsx"),
             office_temp_prefix=self.config_dict.get("office_temp_prefix","~$"),
-            force_uppercase_names=bool(self.config_dict.get("force_uppercase_names", True))
+            force_uppercase_names=bool(self.config_dict.get("force_uppercase_names", True)),
+            move_corrupt=self.move_corrupt.get() and self.rename_on_audit.get()
         )
         self._prepare_and_run("run_library_audit", cfg)
 

@@ -25,6 +25,7 @@ class ProcessorConfig:
     corrupt_folder: str = "_CORRUPT"
     catalog_filename: str = "specifications_catalog.xlsx"
     office_temp_prefix: str = "~$"
+    move_corrupt: bool = False
 
     # Дополнительные поля
     max_retry_attempts: int = 3

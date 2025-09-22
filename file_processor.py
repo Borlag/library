@@ -42,7 +42,7 @@ class FileProcessor:
         self._patterns_initialized = False
         self.rules_engine = RulesEngine(self.config.rules_file, self.logger)
         self.formatter = FileNameFormatter(force_uppercase=self.config.force_uppercase_names)
-        self.hash_cache: Dict[str, Optional[str]] = {}
+        self.hash_cache: Dict[Tuple[str, str], Optional[str]] = {}
 
     def _log(self, message: str, level: str = "INFO"):
         lvl_map = {"DEBUG":10, "INFO":20, "WARNING":30, "ERROR":40, "CRITICAL":50, "SUCCESS":SUCCESS_LEVEL}
@@ -109,12 +109,28 @@ class FileProcessor:
 
         return None
 
-    def get_sha256(self, path: str) -> Optional[str]:
-        if path in self.hash_cache:
-            return self.hash_cache[path]
-        _, h = hash_file_sha256(path)
-        self.hash_cache[path] = h
-        return h
+    def _get_hash_for_mode(self, path: str, mode: Optional[str] = None) -> Optional[str]:
+        hash_mode = mode or self.config.hash_mode
+        if hash_mode == "none":
+            return None
+        key = (hash_mode, path)
+        if key in self.hash_cache:
+            return self.hash_cache[key]
+        if hash_mode == "sampled":
+            _, digest = fast_hash_head_tail(path)
+        else:
+            _, digest = hash_file_sha256(path)
+        self.hash_cache[key] = digest
+        return digest
+
+    def _resolve_conflict_name(self, dest_dir: str, fs_name: str) -> str:
+        idx = 2
+        stem, ext = os.path.splitext(fs_name)
+        while True:
+            candidate = os.path.join(dest_dir, f"{stem}_{idx}{ext}")
+            if not os.path.exists(candidate):
+                return candidate
+            idx += 1
 
     def _scan_source_directories(self) -> List[Tuple[str, Tuple[str,str]]]:
         self._initialize_patterns()
@@ -223,21 +239,17 @@ class FileProcessor:
         # Дубликаты по содержимому (при совпадении имени)
         is_dup = False
         if os.path.exists(final_dest):
-            s_h = self.get_sha256(source_path)
-            d_h = self.get_sha256(final_dest)
+            if self.config.hash_mode != "none":
+                s_h = self._get_hash_for_mode(source_path)
+                d_h = self._get_hash_for_mode(final_dest)
+            else:
+                s_h = d_h = None
+
             if s_h and d_h and s_h == d_h:
                 is_dup = True
                 self._log(f"Пропуск дубликата: {fs_name}", "INFO")
             else:
-                # уникализировать имя
-                idx = 2
-                stem, ext = os.path.splitext(fs_name)
-                while True:
-                    candidate = os.path.join(dest_dir, f"{stem}_{idx}{ext}")
-                    if not os.path.exists(candidate):
-                        final_dest = candidate
-                        break
-                    idx += 1
+                final_dest = self._resolve_conflict_name(dest_dir, fs_name)
                 self._log(f"Файл существует, новое имя: {os.path.basename(final_dest)}", "INFO")
 
         if not is_dup:
@@ -418,7 +430,7 @@ class FileProcessor:
                     actions.append(FileAction(action_type="UNKNOWN", source_path=current["path"], destination_folder=self.config.unknown_folder))
 
             # Проверка "повреждённости" PDF (заголовок)
-            if self.config.rename_on_audit:
+            if self.config.rename_on_audit and self.config.move_corrupt:
                 if current["name"].lower().endswith(".pdf"):
                     try:
                         with open(current["path"], "rb") as f:
@@ -490,7 +502,7 @@ class FileProcessor:
 
             os.makedirs(dest_folder, exist_ok=True)
 
-            if a.action_type == "CORRUPT" and not self.config.rename_on_audit:
+            if a.action_type == "CORRUPT" and (not self.config.rename_on_audit or not self.config.move_corrupt):
                 self._log(f"Обнаружен поврежденный файл (no-op): {os.path.basename(a.source_path)}", "WARNING")
                 return True
 
