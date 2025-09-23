@@ -194,14 +194,11 @@ class FileNameFormatter:
 
     def _ensure_tan_spacing(self, name: str) -> str:
         """
-        Для TAN: "TAN XXX X" — пробел после TAN и после трёх цифр.
+        Для TAN: допускаем только шаблон «TAN XXX XX» без суффиксов/префиксов.
         """
-        m = re.match(r'^(?i:TAN)\s*([0-9]{3})([A-Z0-9]*)', name)
+        m = re.search(r'(?i:TAN)\D*(\d{3})\D*(\d{2})', name)
         if m:
-            tail = m.group(2).lstrip()
-            if tail:
-                return f"TAN {m.group(1)} {tail}"
-            return f"TAN {m.group(1)}"
+            return f"TAN {m.group(1)} {m.group(2)}"
         return name
 
     def format_fs_name(self, basename: str, folder: str, original_abbrev: str) -> str:
