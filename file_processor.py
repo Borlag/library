@@ -533,8 +533,30 @@ class FileProcessor:
                 return True
 
             if os.path.exists(dest_path):
-                self._log(f"Конфликт: '{new_name}' уже существует", "ERROR")
-                return False
+                try:
+                    same_file = os.path.samefile(a.source_path, dest_path)
+                except FileNotFoundError:
+                    same_file = False
+                except OSError:
+                    same_file = False
+
+                if not same_file:
+                    self._log(f"Конфликт: '{new_name}' уже существует", "ERROR")
+                    return False
+
+                if os.path.basename(a.source_path) == new_name:
+                    return True
+
+                temp_path = dest_path + ".__tmp_casefix"
+                suffix = 0
+                while os.path.exists(temp_path):
+                    suffix += 1
+                    temp_path = dest_path + f".__tmp_casefix{suffix}"
+
+                os.rename(a.source_path, temp_path)
+                os.rename(temp_path, dest_path)
+                self._log(f"✓ {a.action_type}: {os.path.basename(dest_path)} -> {os.path.relpath(dest_path, self.config.destination_folder)}", "SUCCESS")
+                return True
 
             shutil.move(a.source_path, dest_path)
             self._log(f"✓ {a.action_type}: {os.path.basename(a.source_path)} -> {os.path.relpath(dest_path, self.config.destination_folder)}", "SUCCESS")
