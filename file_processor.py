@@ -5,10 +5,11 @@ import shutil
 import logging
 from dataclasses import asdict
 from datetime import datetime
-from typing import Dict, List, Optional, Pattern, Tuple, Any
+from typing import Dict, List, Optional, Pattern, Tuple, Any, Set
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed  # ThreadPool only
 from queue import Queue
+from threading import Lock
 
 from models import ProcessorConfig, FileAction
 from renaming_rules import RulesEngine, FileNameFormatter
@@ -43,6 +44,8 @@ class FileProcessor:
         self.rules_engine = RulesEngine(self.config.rules_file, self.logger)
         self.formatter = FileNameFormatter(force_uppercase=self.config.force_uppercase_names)
         self.hash_cache: Dict[Tuple[str, str], Optional[str]] = {}
+        self._dest_lock = Lock()
+        self._in_progress_dests: Set[str] = set()
 
     def _log(self, message: str, level: str = "INFO"):
         lvl_map = {"DEBUG":10, "INFO":20, "WARNING":30, "ERROR":40, "CRITICAL":50, "SUCCESS":SUCCESS_LEVEL}
@@ -128,7 +131,7 @@ class FileProcessor:
         stem, ext = os.path.splitext(fs_name)
         while True:
             candidate = os.path.join(dest_dir, f"{stem}_{idx}{ext}")
-            if not os.path.exists(candidate):
+            if not os.path.exists(candidate) and candidate not in self._in_progress_dests:
                 return candidate
             idx += 1
 
@@ -229,7 +232,8 @@ class FileProcessor:
 
         dest_dir = os.path.join(self.config.destination_folder, target_folder)
         os.makedirs(dest_dir, exist_ok=True)
-        final_dest = os.path.join(dest_dir, fs_name)
+        base_fs_name = fs_name
+        final_dest = os.path.join(dest_dir, base_fs_name)
 
         # если источник уже там
         if os.path.abspath(final_dest) == os.path.abspath(source_path):
@@ -238,23 +242,45 @@ class FileProcessor:
 
         # Дубликаты по содержимому (при совпадении имени)
         is_dup = False
-        if os.path.exists(final_dest):
-            if self.config.hash_mode != "none":
-                s_h = self._get_hash_for_mode(source_path)
-                d_h = self._get_hash_for_mode(final_dest)
-            else:
-                s_h = d_h = None
+        reserve_path = None
+        renamed_to: Optional[str] = None
+        try:
+            with self._dest_lock:
+                while True:
+                    if os.path.exists(final_dest):
+                        if self.config.hash_mode != "none":
+                            s_h = self._get_hash_for_mode(source_path)
+                            d_h = self._get_hash_for_mode(final_dest)
+                        else:
+                            s_h = d_h = None
 
-            if s_h and d_h and s_h == d_h:
-                is_dup = True
-                self._log(f"Пропуск дубликата: {fs_name}", "INFO")
-            else:
-                final_dest = self._resolve_conflict_name(dest_dir, fs_name)
-                self._log(f"Файл существует, новое имя: {os.path.basename(final_dest)}", "INFO")
+                        if s_h and d_h and s_h == d_h:
+                            is_dup = True
+                            self._log(f"Пропуск дубликата: {os.path.basename(final_dest)}", "INFO")
+                            break
 
-        if not is_dup:
-            # Атомарная копия
-            copy2_atomic(source_path, final_dest)
+                        final_dest = self._resolve_conflict_name(dest_dir, base_fs_name)
+                        renamed_to = os.path.basename(final_dest)
+                        continue
+
+                    if final_dest in self._in_progress_dests:
+                        final_dest = self._resolve_conflict_name(dest_dir, base_fs_name)
+                        renamed_to = os.path.basename(final_dest)
+                        continue
+
+                    self._in_progress_dests.add(final_dest)
+                    reserve_path = final_dest
+                    break
+
+            if not is_dup:
+                if renamed_to:
+                    self._log(f"Файл существует, новое имя: {renamed_to}", "INFO")
+                # Атомарная копия
+                copy2_atomic(source_path, final_dest)
+        finally:
+            if reserve_path:
+                with self._dest_lock:
+                    self._in_progress_dests.discard(reserve_path)
 
         # Режимы
         if self.config.mode == "move":
