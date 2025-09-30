@@ -81,19 +81,12 @@ class ExcelCatalog:
     def _open_or_create_wb(self):
         wb = None
         ws = None
-        existing_index = {}
+        loaded_existing = False
         if self.config.append_mode and os.path.exists(self.xlsx_path):
             try:
                 wb = openpyxl.load_workbook(self.xlsx_path)
                 ws = wb.active
-                for i, row in enumerate(ws.iter_rows(min_row=2), start=2):
-                    link_cell = row[8]
-                    modified_cell = row[6]
-                    link_target = link_cell.hyperlink.target if (link_cell and link_cell.hyperlink) else ""
-                    modified_text = modified_cell.value if modified_cell else ""
-                    if link_target and modified_text:
-                        existing_index[(link_target, str(modified_text))] = i
-                self.log(f"Режим 'Дополнять': найдено {len(existing_index)} записей.", "INFO")
+                loaded_existing = True
             except Exception as e:
                 self.log(f"Не удалось открыть существующий каталог: {e}", "WARNING")
                 wb = None
@@ -107,7 +100,78 @@ class ExcelCatalog:
             for cell in ws[1]:
                 cell.font = Font(bold=True)
 
-        return wb, ws, existing_index
+        return wb, ws, loaded_existing
+
+    def _gather_existing_rows(self, ws):
+        rows = {}
+        by_path = {}
+        by_norm_key = {}
+        by_size_mod = {}
+        for i, row in enumerate(ws.iter_rows(min_row=2), start=2):
+            values = []
+            for idx in range(len(self.HEADERS)):
+                if idx < len(row):
+                    values.append(row[idx].value)
+                else:
+                    values.append("")
+            link_cell = row[8] if len(row) >= 9 else None
+            link_target = link_cell.hyperlink.target if (link_cell and link_cell.hyperlink) else ""
+            entry = {
+                "values": values,
+                "link": link_target or "",
+            }
+
+            norm_path = os.path.normcase(link_target) if link_target else ""
+            if norm_path:
+                by_path[norm_path] = i
+
+            norm_display = self._normalize_key(values[1] or "")
+            norm_link_name = self._normalize_key(os.path.basename(link_target)) if link_target else ""
+            keys = set(filter(None, [norm_display, norm_link_name]))
+            for key in keys:
+                by_norm_key.setdefault(key, []).append(i)
+
+            size_val = values[5]
+            try:
+                size_float = float(size_val) if size_val is not None and size_val != "" else None
+            except (TypeError, ValueError):
+                size_float = None
+            modified_val = values[6] if len(values) > 6 else None
+            modified_str = str(modified_val) if modified_val else ""
+            entry["size_mb"] = size_float
+            entry["modified"] = modified_str
+            if size_float is not None and modified_str:
+                key = (round(size_float, 3), modified_str)
+                by_size_mod.setdefault(key, []).append(i)
+
+            rows[i] = entry
+
+        return rows, by_path, by_norm_key, by_size_mod
+
+    def _find_existing_match(self, filepath, norm_disp, norm_raw, size_mb, modified,
+                              by_path, by_norm_key, by_size_mod, existing_rows, matched_rows):
+        norm_path = os.path.normcase(filepath)
+        idx = by_path.get(norm_path)
+        if idx and idx not in matched_rows:
+            return idx
+
+        for key in filter(None, [norm_disp, norm_raw]):
+            candidates = by_norm_key.get(key)
+            if not candidates:
+                continue
+            for cand in candidates:
+                if cand not in matched_rows:
+                    return cand
+
+        if size_mb is not None and modified:
+            key = (round(size_mb, 3), modified)
+            candidates = by_size_mod.get(key)
+            if candidates:
+                for cand in candidates:
+                    if cand not in matched_rows:
+                        return cand
+
+        return None
 
     # --- Извлечение ревизии ---
     def _extract_revision(self, display_name: str, filename_no_ext: str) -> str:
@@ -174,11 +238,23 @@ class ExcelCatalog:
         self.log("Начало генерации каталога.", "INFO")
         os.makedirs(self.config.destination_folder, exist_ok=True)
 
-        wb, ws, existing_index = self._open_or_create_wb()
+        wb, ws, loaded_existing = self._open_or_create_wb()
+        existing_rows = {}
+        by_path = {}
+        by_norm_key = {}
+        by_size_mod = {}
+        if loaded_existing:
+            existing_rows, by_path, by_norm_key, by_size_mod = self._gather_existing_rows(ws)
+            self.log(f"Режим 'Дополнять': найдено {len(existing_rows)} записей.", "INFO")
+
         tags_map = self._load_tags_map()
         all_files = scan_all_files_recursive(self.config.destination_folder)
         link_font = Font(color="0000FF", underline="single")
         row_count_added = 0
+        row_count_updated = 0
+        matched_rows = set()
+        updated_entries = {}
+        new_entries = []
 
         corrupt_norm = os.path.normcase(self.config.corrupt_folder)
 
@@ -209,17 +285,26 @@ class ExcelCatalog:
             except FileNotFoundError:
                 size_mb, modified = 0, ""
 
-            key = (filepath, modified)
-            if existing_index and key in existing_index:
-                continue
-
             norm_disp = self._normalize_key(display)
             norm_raw = self._normalize_key(filename)
             tags_value = tags_map.get(norm_disp) or tags_map.get(norm_raw) or ""
 
             revision = self._extract_revision(display, base)
 
-            row = [
+            match_idx = self._find_existing_match(
+                filepath,
+                norm_disp,
+                norm_raw,
+                size_mb,
+                modified,
+                by_path,
+                by_norm_key,
+                by_size_mod,
+                existing_rows,
+                matched_rows,
+            ) if existing_rows else None
+
+            row_values = [
                 abbrev,
                 display,
                 ext.lstrip('.').lower(),
@@ -230,15 +315,65 @@ class ExcelCatalog:
                 "",
                 "Открыть файл"
             ]
-            ws.append(row)
+            if match_idx:
+                existing_entry = existing_rows.get(match_idx, {})
+                existing_values = existing_entry.get("values", [])
+                if existing_values:
+                    if not row_values[4] and len(existing_values) > 4 and existing_values[4]:
+                        row_values[4] = existing_values[4]
+                    if not row_values[3] and len(existing_values) > 3 and existing_values[3]:
+                        row_values[3] = existing_values[3]
+                    if (row_values[5] is None or row_values[5] == 0) and len(existing_values) > 5 and existing_values[5]:
+                        try:
+                            row_values[5] = float(existing_values[5])
+                        except (TypeError, ValueError):
+                            row_values[5] = existing_values[5]
+                    if not row_values[6] and len(existing_values) > 6 and existing_values[6]:
+                        row_values[6] = existing_values[6]
+                updated_entries[match_idx] = {
+                    "values": row_values,
+                    "link": filepath,
+                }
+                matched_rows.add(match_idx)
+                row_count_updated += 1
+            else:
+                new_entries.append({
+                    "values": row_values,
+                    "link": filepath,
+                })
+                row_count_added += 1
+
+        final_rows = []
+        if updated_entries:
+            for idx in sorted(updated_entries.keys()):
+                final_rows.append(updated_entries[idx])
+
+        if new_entries:
+            new_entries.sort(key=lambda item: (item["values"][0] or "", item["values"][1] or ""))
+            final_rows.extend(new_entries)
+
+        # Очистка старых строк
+        existing_rows_count = ws.max_row - 1
+        if existing_rows_count > 0:
+            ws.delete_rows(2, existing_rows_count)
+
+        for entry in final_rows:
+            ws.append(entry["values"])
             link_cell = ws.cell(row=ws.max_row, column=9)
-            link_cell.hyperlink = filepath
+            link_cell.hyperlink = entry["link"]
             link_cell.font = link_font
-            row_count_added += 1
 
         try:
             wb.save(self.xlsx_path)
             self.log(f"Каталог сохранен: {self.xlsx_path}", "SUCCESS")
-            self.log(f"Добавлено записей: {row_count_added}", "INFO")
         except PermissionError:
             self.log("Не удалось сохранить каталог. Файл открыт в другой программе.", "ERROR")
+            return
+
+        removed_rows = len(existing_rows) - len(matched_rows) if existing_rows else 0
+        if row_count_updated:
+            self.log(f"Обновлено записей: {row_count_updated}", "INFO")
+        if row_count_added:
+            self.log(f"Добавлено записей: {row_count_added}", "INFO")
+        if removed_rows:
+            self.log(f"Удалено записей: {removed_rows}", "INFO")
