@@ -108,16 +108,16 @@ class ExcelCatalog:
         by_norm_key = {}
         by_size_mod = {}
         for i, row in enumerate(ws.iter_rows(min_row=2), start=2):
-            values = []
-            for idx in range(len(self.HEADERS)):
-                if idx < len(row):
-                    values.append(row[idx].value)
-                else:
-                    values.append("")
+            raw_values = [cell.value for cell in row]
+            header_values = raw_values[:len(self.HEADERS)]
+            if len(header_values) < len(self.HEADERS):
+                header_values.extend([""] * (len(self.HEADERS) - len(header_values)))
+            extra_values = raw_values[len(self.HEADERS):]
             link_cell = row[8] if len(row) >= 9 else None
             link_target = link_cell.hyperlink.target if (link_cell and link_cell.hyperlink) else ""
             entry = {
-                "values": values,
+                "values": header_values,
+                "extras": extra_values,
                 "link": link_target or "",
             }
 
@@ -125,18 +125,18 @@ class ExcelCatalog:
             if norm_path:
                 by_path[norm_path] = i
 
-            norm_display = self._normalize_key(values[1] or "")
+            norm_display = self._normalize_key(header_values[1] or "")
             norm_link_name = self._normalize_key(os.path.basename(link_target)) if link_target else ""
             keys = set(filter(None, [norm_display, norm_link_name]))
             for key in keys:
                 by_norm_key.setdefault(key, []).append(i)
 
-            size_val = values[5]
+            size_val = header_values[5]
             try:
                 size_float = float(size_val) if size_val is not None and size_val != "" else None
             except (TypeError, ValueError):
                 size_float = None
-            modified_val = values[6] if len(values) > 6 else None
+            modified_val = header_values[6] if len(header_values) > 6 else None
             modified_str = str(modified_val) if modified_val else ""
             entry["size_mb"] = size_float
             entry["modified"] = modified_str
@@ -318,10 +318,11 @@ class ExcelCatalog:
             if match_idx:
                 existing_entry = existing_rows.get(match_idx, {})
                 existing_values = existing_entry.get("values", [])
+                existing_extras = existing_entry.get("extras", [])
                 if existing_values:
-                    if not row_values[4] and len(existing_values) > 4 and existing_values[4]:
+                    if len(existing_values) > 4 and existing_values[4]:
                         row_values[4] = existing_values[4]
-                    if not row_values[3] and len(existing_values) > 3 and existing_values[3]:
+                    if len(existing_values) > 3 and existing_values[3]:
                         row_values[3] = existing_values[3]
                     if (row_values[5] is None or row_values[5] == 0) and len(existing_values) > 5 and existing_values[5]:
                         try:
@@ -332,6 +333,7 @@ class ExcelCatalog:
                         row_values[6] = existing_values[6]
                 updated_entries[match_idx] = {
                     "values": row_values,
+                    "extras": existing_extras,
                     "link": filepath,
                 }
                 matched_rows.add(match_idx)
@@ -339,6 +341,7 @@ class ExcelCatalog:
             else:
                 new_entries.append({
                     "values": row_values,
+                    "extras": [],
                     "link": filepath,
                 })
                 row_count_added += 1
@@ -358,7 +361,11 @@ class ExcelCatalog:
             ws.delete_rows(2, existing_rows_count)
 
         for entry in final_rows:
-            ws.append(entry["values"])
+            row_payload = list(entry["values"])
+            extras = entry.get("extras") or []
+            if extras:
+                row_payload.extend(extras)
+            ws.append(row_payload)
             link_cell = ws.cell(row=ws.max_row, column=9)
             link_cell.hyperlink = entry["link"]
             link_cell.font = link_font
